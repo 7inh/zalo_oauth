@@ -3,13 +3,13 @@ import hashlib
 import base64
 import secrets
 import urllib.parse
+import json
 from typing import Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime
 
-import httpx
+import requests
 from fastapi import FastAPI, Request, Response, HTTPException, status, Cookie
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel
 import logging
 
 # Configure logging
@@ -30,36 +30,6 @@ ZALO_TOKEN_URL = "https://oauth.zaloapp.com/v4/access_token"
 ZALO_USER_INFO_URL = "https://graph.zalo.me/v2.0/me"
 
 
-class ZaloTokenResponse(BaseModel):
-    access_token: str
-    token_type: str
-    expires_in: int
-    refresh_token: str
-
-
-class ZaloUserInfo(BaseModel):
-    id: str
-    name: str
-    picture: Optional[Dict[str, Any]] = None
-
-
-class AuthUrlResponse(BaseModel):
-    loginUrl: str
-    state: str
-    codeChallenge: str
-
-
-class CallbackResponse(BaseModel):
-    success: bool
-    user_info: Dict[str, Any]
-    is_new_user: bool
-    access_token: str
-    refresh_token: str
-    provider: str
-    zalo_access_token: str
-    referral_code: Optional[str] = None
-
-
 def generate_code_verifier() -> str:
     """Generate a cryptographically random code verifier for PKCE."""
     return secrets.token_urlsafe(96)
@@ -76,7 +46,7 @@ def generate_state() -> str:
     return secrets.token_urlsafe(32)
 
 
-@app.get("/auth/zalo", response_model=AuthUrlResponse)
+@app.get("/auth/zalo")
 async def get_zalo_auth_url(response: Response):
     """Generate Zalo OAuth authorization URL."""
     try:
@@ -113,9 +83,10 @@ async def get_zalo_auth_url(response: Response):
         logger.info(f"🔍 [DEBUG] Code verifier (for callback): {code_verifier}")
 
         # Set secure cookies for state verification
+        is_production = os.getenv("ENVIRONMENT") == "production"
         cookie_settings = {
             "httponly": True,
-            "secure": os.getenv("ENVIRONMENT") == "production",
+            "secure": is_production,
             "samesite": "lax",
             "max_age": 600,  # 10 minutes
         }
@@ -125,11 +96,11 @@ async def get_zalo_auth_url(response: Response):
 
         logger.info("🔍 [DEBUG] Response cookies set for state and code verifier")
 
-        return AuthUrlResponse(
-            loginUrl=zalo_auth_url,
-            state=state,
-            codeChallenge=code_challenge
-        )
+        return {
+            "loginUrl": zalo_auth_url,
+            "state": state,
+            "codeChallenge": code_challenge
+        }
 
     except Exception as error:
         logger.error(f"Error generating Zalo login URL: {error}")
@@ -172,7 +143,7 @@ async def zalo_callback_redirect(
             return RedirectResponse(url=error_url)
 
         # Get user data from callback processing
-        user_data = await process_zalo_callback(code, zalo_code_verifier or "")
+        user_data = process_zalo_callback(code, zalo_code_verifier or "")
         
         # Redirect to success page with user data
         success_params = {
@@ -205,7 +176,7 @@ async def zalo_callback_redirect(
         return RedirectResponse(url=error_url)
 
 
-@app.post("/auth/zalo/callback", response_model=CallbackResponse)
+@app.post("/auth/zalo/callback")
 async def zalo_callback_api(
     request: Request,
     code: Optional[str] = None,
@@ -235,25 +206,25 @@ async def zalo_callback_api(
             )
 
         # Get user data from callback processing
-        user_data = await process_zalo_callback(code, zalo_code_verifier or "")
+        user_data = process_zalo_callback(code, zalo_code_verifier or "")
         zalo_access_token = user_data.pop("zalo_access_token", "")
 
         # Return authentication data
-        return CallbackResponse(
-            success=True,
-            user_info={
+        return {
+            "success": True,
+            "user_info": {
                 "id": user_data["id"],
                 "name": user_data["name"],
                 "avatar": user_data.get("avatar"),
                 "email": None,  # Zalo doesn't provide email by default
             },
-            is_new_user=True,  # You would determine this from your database
-            access_token="your_generated_jwt_token",  # Generate your own JWT
-            refresh_token="your_generated_refresh_token",  # Generate your own refresh token
-            provider="zalo",
-            zalo_access_token=zalo_access_token,
-            referral_code=referral_code,
-        )
+            "is_new_user": True,  # You would determine this from your database
+            "access_token": "your_generated_jwt_token",  # Generate your own JWT
+            "refresh_token": "your_generated_refresh_token",  # Generate your own refresh token
+            "provider": "zalo",
+            "zalo_access_token": zalo_access_token,
+            "referral_code": referral_code,
+        }
 
     except HTTPException:
         raise
@@ -265,73 +236,72 @@ async def zalo_callback_api(
         )
 
 
-async def process_zalo_callback(code: str, code_verifier: str) -> Dict[str, Any]:
+def process_zalo_callback(code: str, code_verifier: str) -> Dict[str, Any]:
     """Process Zalo OAuth callback and return user data."""
-    async with httpx.AsyncClient() as client:
-        # Exchange authorization code for access token
-        logger.info("🔍 [DEBUG] Token Exchange Request:")
-        logger.info(f"  - app_id: {ZALO_APP_ID}")
-        logger.info(f"  - code: {code}")
-        logger.info(f"  - code_verifier: {code_verifier}")
+    # Exchange authorization code for access token
+    logger.info("🔍 [DEBUG] Token Exchange Request:")
+    logger.info(f"  - app_id: {ZALO_APP_ID}")
+    logger.info(f"  - code: {code}")
+    logger.info(f"  - code_verifier: {code_verifier}")
 
-        token_data = {
-            "app_id": ZALO_APP_ID,
-            "grant_type": "authorization_code",
-            "code": code,
-            "code_verifier": code_verifier,
-        }
+    token_data = {
+        "app_id": ZALO_APP_ID,
+        "grant_type": "authorization_code",
+        "code": code,
+        "code_verifier": code_verifier,
+    }
 
-        token_response = await client.post(
-            ZALO_TOKEN_URL,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "secret_key": ZALO_APP_SECRET,
-            },
-            data=token_data
+    token_response = requests.post(
+        ZALO_TOKEN_URL,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "secret_key": ZALO_APP_SECRET,
+        },
+        data=token_data
+    )
+
+    if not token_response.ok:
+        error_text = token_response.text
+        logger.error(f"Zalo token exchange failed: {error_text}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Failed to exchange authorization code for token"
         )
 
-        if not token_response.is_success:
-            error_text = token_response.text
-            logger.error(f"Zalo token exchange failed: {error_text}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to exchange authorization code for token"
-            )
+    token_json = token_response.json()
+    access_token = token_json["access_token"]
+    
+    logger.info("🔍 [DEBUG] Token Exchange Success:")
+    logger.info(f"  - access_token: {access_token[:20]}...")
+    logger.info(f"  - expires_in: {token_json.get('expires_in')}")
 
-        token_json = token_response.json()
-        access_token = token_json["access_token"]
-        
-        logger.info("🔍 [DEBUG] Token Exchange Success:")
-        logger.info(f"  - access_token: {access_token[:20]}...")
-        logger.info(f"  - expires_in: {token_json.get('expires_in')}")
+    # Get user information from Zalo
+    user_response = requests.get(
+        f"{ZALO_USER_INFO_URL}?fields=id,name,picture",
+        headers={"access_token": access_token}
+    )
 
-        # Get user information from Zalo
-        user_response = await client.get(
-            f"{ZALO_USER_INFO_URL}?fields=id,name,picture",
-            headers={"access_token": access_token}
+    if not user_response.ok:
+        error_text = user_response.text
+        logger.error(f"Zalo user info fetch failed: {error_text}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Failed to fetch user information from Zalo"
         )
 
-        if not user_response.is_success:
-            error_text = user_response.text
-            logger.error(f"Zalo user info fetch failed: {error_text}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to fetch user information from Zalo"
-            )
+    user_json = user_response.json()
+    
+    logger.info("🔍 [DEBUG] User Info Retrieved:")
+    logger.info(f"  - id: {user_json['id']}")
+    logger.info(f"  - name: {user_json['name']}")
+    logger.info(f"  - avatar: {user_json.get('picture', {}).get('data', {}).get('url')}")
 
-        user_json = user_response.json()
-        
-        logger.info("🔍 [DEBUG] User Info Retrieved:")
-        logger.info(f"  - id: {user_json['id']}")
-        logger.info(f"  - name: {user_json['name']}")
-        logger.info(f"  - avatar: {user_json.get('picture', {}).get('data', {}).get('url')}")
-
-        return {
-            "id": user_json["id"],
-            "name": user_json["name"],
-            "avatar": user_json.get("picture", {}).get("data", {}).get("url"),
-            "zalo_access_token": access_token,
-        }
+    return {
+        "id": user_json["id"],
+        "name": user_json["name"],
+        "avatar": user_json.get("picture", {}).get("data", {}).get("url"),
+        "zalo_access_token": access_token,
+    }
 
 
 @app.get("/auth/zalo/error")
@@ -368,9 +338,16 @@ async def zalo_success_page(
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+
+@app.get("/")
+async def root():
+    """Root endpoint."""
+    return {"message": "Zalo OAuth Server", "status": "running"}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
