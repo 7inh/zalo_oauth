@@ -158,6 +158,7 @@ async def verify_zalo_login(
     resp.delete_cookie("zalo_state_at", path="/")
     return resp
 
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
